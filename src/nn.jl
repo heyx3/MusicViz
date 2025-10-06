@@ -5,7 +5,7 @@ Turns an audio sample into a matrix of continuous Float32 FFT results
     by moving a window across the samples.
 
 Returns a matrix where each column is an FFT in one window,
-   `window_size_samples x (length(samples) ÷ window_hop_samples)`.
+   `window_size_samples x (length(samples) ÷ window_sample_overlap)`.
 
 The output samples are not in Hz with amplitudes,
    but perceptually-linear Mels with perceptually-linear volume.
@@ -15,7 +15,7 @@ function nn_get_input_spectrogram(samples::AbstractVector{<:AbstractFloat},
                                   window = hanning
                                   ;
                                   window_size_samples::Int = 1024,
-                                  window_hop_samples::Int = window_size_samples ÷ 2,
+                                  window_sample_overlap::Int = window_size_samples ÷ 2,
                                   n_frequency_buckets::Int = 64,
                                   buffer::Vector{Float32} = Float32[ ]
                                  )::Matrix{Float32}
@@ -28,19 +28,19 @@ function nn_get_input_spectrogram(samples::AbstractVector{<:AbstractFloat},
     buffer .= (samples .- μ) ./ (σ + @f32(1e-6))
 
     # Take a continuous sliding-window FFT of the samples.
-    window_weights = window(window_size_samples)
-    stft_samples_full = stft(buffer, window_size_samples, window_hop_samples)
+    stft_samples_full = DSP.stft(buffer, window_size_samples, window_sample_overlap,
+                                 window=window, fs=sample_rate)
     stft_samples_mag = abs.(stft_samples_full)
 
     # Convert FFT frequencies from Hz (physically-linear) to Mels (perceptually-linear).
     (n_stft_bins, n_frames) = size(stft_samples_mag)
-    stft_frequencies = range(start=0.0f0,
-                             stop=sample_rate/2.0f0,
-                             length=Float32(n_stft_bins))
+    # stft_frequencies = range(start=0.0f0,
+    #                          stop=sample_rate/2.0f0,
+    #                          length=Float32(n_stft_bins))
     mel_samples = transpose(melscale_filterbanks(n_freqs = n_stft_bins,
                                                  n_mels = n_frequency_buckets,
-                                                 sample_rate = sample_rate,
-                                                 fmin=0,
+                                                 sample_rate = Int(sample_rate),
+                                                 fmin=0.0f0,
                                                  fmax=sample_rate/2)
                            ) * stft_samples_mag
     mel_samples .= log.(mel_samples .+ @f32(1e-6))
@@ -54,7 +54,7 @@ A lazy-iterator over the neural network inputs for small chunks of time (e.g. 1 
    usually with overlap between the chunks.
 
 All returned inputs are exactly the same size (`window_size_samples` x
-   `Int(sample_rate * chunk_size_seconds) ÷ window_hop_samples`).
+   `Int(sample_rate * chunk_size_seconds) ÷ window_sample_overlap`).
 
 Iteration re-uses allocations internally, so you shouldn't hold onto data from one chunk
    while moving to the next!
@@ -68,7 +68,7 @@ Iteration re-uses allocations internally, so you shouldn't hold onto data from o
     # Inside each chunk the FFT is an STFT, a.k.a. a moving window of the chunk's samples.
     window::TWindow = hanning
     window_size_samples::Int = 1024
-    window_hop_samples::Int = 512
+    window_sample_overlap::Int = 512
     n_frequency_buckets::Int = 64
 
 end
@@ -116,7 +116,7 @@ function impl_chunked_audio(chunker::nn_chunked_audio,
         chunker.window,
 
         window_size_samples=chunker.window_size_samples,
-        window_hop_samples=chunker.window_hop_samples,
+        window_sample_overlap=chunker.window_sample_overlap,
         n_frequency_buckets=chunker.n_frequency_buckets,
 
         buffer = buffer1
