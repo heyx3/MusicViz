@@ -56,7 +56,6 @@ export iter_cumsum
 struct iter_diff{TElements}
     elements::TElements
 end
-iter_diff(elements) = iter_diff{typeof(elements)}(elements)
 
 Base.IteratorEltype(::Type{<:iter_diff{TElements}}) where {TElements} = Base.IteratorEltype(TElements)
 Base.eltype(::Type{<:iter_diff{TElements}}) where {TElements} = let et = eltype(TElements)
@@ -104,3 +103,30 @@ function Base.iterate(id::iter_diff{TElements}, (inner_el, inner_state)) where {
 end
 
 export iter_diff
+
+
+######################################
+##    Smaller functions
+
+"Exactly like `findfirst()` but can work on any iterator of bools"
+function find_first_of_iter(bools)::Optional{Int}
+    for (i, b) in enumerate(bools)
+        if b
+            return i
+        end
+    end
+    return nothing
+end
+
+consecutive_pairs(iter) = zip(iter, last(Iterators.peel(iter)))
+
+export find_first_of_iter
+
+
+#####################################
+##    Audio stuff
+
+hz_to_mel(hz) = convert(typeof(hz), 2595 * log10(1 + (hz / 700)))
+mel_to_hz(mel) = convert(typeof(mel), 700 * (10^(mels / 2595) - 1))
+
+export hz_to_mel, mel_to_hz
