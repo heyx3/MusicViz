@@ -187,7 +187,7 @@ function test_chunked_audio(chunker::nn_chunked_audio,
     end
 end
 
-export nn_chunked_audio, test_chunked_audio
+export nn_chunked_audio, nn_chunked_input_size, test_chunked_audio
 
 
 
@@ -216,10 +216,45 @@ const NN_CONVOLUTION_OUT_N_CHANNELS = 64
 
 "Shorthand for the shape of the neural network data after the first convolutional layers"
 nn_chain_shape_after_convolution(settings::NN_Settings)::NTuple{3, Int} = (
-    (nn_input_size(settings.input_settings, settings.chunk_size_samples) .÷ Ref(4))...,
+    ((nn_input_size(settings.input_settings, settings.chunk_size_samples) .+ Ref(3)) .÷ Ref(4))...,
     NN_CONVOLUTION_OUT_N_CHANNELS
 )
 
+"
+Given a sequence of `Conv` layers eventually followed by corresponding `ConvTranspose` inverse layers,
+  computes how much padding to put in each `ConvTranspose` inverse layer.
+"
+function nn_convolution_layer_padding(input_size::NTuple{2, Int}, n_layers::Int,
+                                      stride::NTuple{2, Int},
+                                      pad::NTuple{2, Int},
+                                      kernel::NTuple{2, Int},
+                                      dilation::NTuple{2, Int}
+                                     )::Vector{NTuple{2, Int}}
+    # Forward conv formula: out = floor((in + 2*pad - dilation*(kernel-1) -1)/stride)+1
+    sizes = [ input_size ]
+    for i in 1:n_layers
+        push!(sizes,
+            fld.(
+                sizes[end] .+ (Ref(2) .* pad) .- (dilation .* (kernel .- Ref(1))) .- Ref(1),
+                stride
+            ) .+ Ref(1)
+        )
+    end
+
+    # ConvTranspose formula: out = (in-1)*stride - 2*pad + dilation*(kernel-1) + output_padding + 1
+    #          => output_padding = out - (in-1)*stride + 2*pad - dilation*(kernel-1) - 1
+    paddings = NTuple{2, Int}[ ]
+    for i in n_layers:-1:1
+        size_in = sizes[i+1]
+        size_out = sizes[i]
+        push!(paddings,
+            size_out .- (dilation .* (kernel .- Ref(1))) .+
+            (pad .* Ref(2)) .- (stride .* (size_in .- Ref(1))) .- Ref(1)
+        )
+    end
+
+    return paddings
+end
 
 """
 Defines the first half of the neural net,
@@ -228,25 +263,28 @@ Defines the first half of the neural net,
 To train this half without labeled data you also need a 'decoder' afterwards
    which unpacks the outputs into a reconstruction of the input.
 """
-nn_chain_encoder(settings::NN_Settings) = Chain(
-    # Convolutional layer with 32 different 3x3 kernels,
-    #    offsetting each kernel application by 2 pixels to halve the output resolution vs input.
-    Conv((3, 3), 1 => 32, relu;
-         stride=2, pad=1),
-    # Convolutional layer with 64 different 3x3 kernels,
-    #    offsetting each kernel applicationo by 2 pixels to halve the output resolution again.
-    Conv((3, 3), 32 => 64, relu;
-         stride=2, pad=1),
+function nn_chain_encoder(settings::NN_Settings)
+    convolved_size = nn_chain_shape_after_convolution(settings)
+    return Chain(
+        # Convolutional layer with 32 different 3x3 kernels,
+        #    offsetting each kernel application by 2 pixels to halve the output resolution vs input.
+        Conv((3, 3), 1 => 32, relu;
+             stride=2, pad=1),
+        # Convolutional layer with 64 different 3x3 kernels,
+        #    offsetting each kernel applicationo by 2 pixels to halve the output resolution again.
+        Conv((3, 3), 32 => 64, relu;
+             stride=2, pad=1),
 
-    # Flatten the convolutional features into a 1D array (plus batch axis), for traditional NN layers:
-    x -> reshape(x, :, size(x, 4)),
+        # Flatten the convolutional features into a 1D array (plus batch axis), for traditional NN layers:
+        x -> reshape(x, :, size(x, 4)),
 
-    # Add a traditional DNN layer.
-    Dense(prod(nn_chain_shape_after_convolution(settings)) => 128, relu),
+        # Add a traditional DNN layer.
+        Dense(prod(convolved_size) => 128, relu),
 
-    # Add the output layer.
-    Dense(128 => settings.n_outputs)
-)
+        # Add the output layer.
+        Dense(128 => settings.n_outputs)
+    )
+end
 
 """
 Defines the second half of the neural net,
@@ -254,18 +292,26 @@ Defines the second half of the neural net,
 
 This half is needed to train the first half without labeled data.
 """
-nn_chain_decoder(settings::NN_Settings) = Chain(
-    # Invert the layers from the encoder.
-    Dense(settings.n_outputs => 128, relu),
-    Dense(128 => prod(nn_chain_shape_after_convolution(settings)), relu),
-    x -> let shape3D = nn_chain_shape_after_convolution(settings)
-           reshape(x, (shape3D..., size(x, 2)))
-    end,
-    ConvTranspose((3, 3), 64 => 32, relu;
-                  stride=2, pad=1),
-    ConvTranspose((3, 3), 32 => 1;
-                  stride=2, pad=1)
-)
+function nn_chain_decoder(settings::NN_Settings)
+    input_size = nn_input_size(settings.input_settings, settings.chunk_size_samples)
+    convolved_size = nn_chain_shape_after_convolution(settings)
+    conv_paddings = nn_convolution_layer_padding(input_size, 2,
+                                                 (2, 2), (1, 1), (3, 3), (1, 1))
+    return Chain(
+        # Invert the layers from the encoder.
+        Dense(settings.n_outputs => 128, relu),
+        Dense(128 => prod(convolved_size), relu),
+        x -> reshape(x, (convolved_size..., size(x, 2))),
+        ConvTranspose((3, 3), 64 => 32, relu;
+                      stride=2, pad=1,
+                      outpad=conv_paddings[1]),
+        ConvTranspose((3, 3), 32 => 1;
+                      stride=2, pad=1,
+                      outpad=conv_paddings[2])
+    )
+end
+
+nn_chain_full(settings::NN_Settings) = Chain(nn_chain_encoder(settings), nn_chain_decoder(settings))
 
 
-export NN_Settings, nn_chain_encoder, nn_chain_decoder
+export NN_Settings, nn_chain_encoder, nn_chain_decoder, nn_chain_full
