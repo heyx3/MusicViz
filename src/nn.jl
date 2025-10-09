@@ -1,22 +1,52 @@
 # Implementation of a neural-net approach to visualization.
 
+
+#################################################
+##   Input spectrogram generation
+
+"""
+Rules for how to generate the neural network input from an audio sample.
+
+The sample is broken into small overlapping windows, and a running FFT is taken for each window,
+    producing a spectrogram in perceptually-linear space.
+"""
+@kwdef struct NN_InputSettings{TWindow<:Base.Callable}
+    window::TWindow = hanning
+    window_size_samples::Int = 2048
+    window_overlap_samples::Int = window_size_samples ÷ 2
+    n_output_frequency_buckets::Int = 64
+end
+
+"The size of the neural network's input, produced according to the given settings and with the given input size"
+nn_input_size(settings::NN_InputSettings, sample_count::Int)::NTuple{2, Int} = (
+    # Audio is a real-valued signal, and analysis doesn't need the Phase,
+    #    so only take the magnitudes of the front-half of the complex FFT.
+    settings.n_output_frequency_buckets,
+    # Turning the window parameters into a count involves a lot of integer math;
+    #    DSP.jl already does it for us but there's no easy way to access it :(
+    # So this is a copy of the 'k' field computed in `DSP.ArraySplit(...)`.
+    (sample_count >= settings.window_size_samples) ?
+        ((sample_count - settings.window_size_samples) ÷
+         (settings.window_size_samples - settings.window_overlap_samples)
+        )+1 :
+        0
+)
+
 "
 Turns an audio sample into a matrix of continuous Float32 FFT results
     by moving a window across the samples.
 
-Returns a matrix where each column is an FFT in one window,
-   `window_size_samples x (length(samples) ÷ window_sample_overlap)`.
+Returns a matrix where each column is the FFT of one window,
+   `settings.n_output_frequency_buckets × window_count`.
+You can compute this size with `nn_input_size()`.
 
 The output samples are not in Hz with amplitudes,
    but perceptually-linear Mels with perceptually-linear volume.
 "
 function nn_get_input_spectrogram(samples::AbstractVector{<:AbstractFloat},
                                   sample_rate::Float32,
-                                  window = hanning
+                                  settings::NN_InputSettings
                                   ;
-                                  window_size_samples::Int = 1024,
-                                  window_sample_overlap::Int = window_size_samples ÷ 2,
-                                  n_frequency_buckets::Int = 64,
                                   buffer::Vector{Float32} = Float32[ ]
                                  )::Matrix{Float32}
     # Normalize the audio samples.
@@ -28,8 +58,8 @@ function nn_get_input_spectrogram(samples::AbstractVector{<:AbstractFloat},
     buffer .= (samples .- μ) ./ (σ + @f32(1e-6))
 
     # Take a continuous sliding-window FFT of the samples.
-    stft_samples_full = DSP.stft(buffer, window_size_samples, window_sample_overlap,
-                                 window=window, fs=sample_rate)
+    stft_samples_full = DSP.stft(buffer, settings.window_size_samples, settings.window_overlap_samples,
+                                 window=settings.window, fs=sample_rate)
     stft_samples_mag = abs.(stft_samples_full)
 
     # Convert FFT frequencies from Hz (physically-linear) to Mels (perceptually-linear).
@@ -38,46 +68,68 @@ function nn_get_input_spectrogram(samples::AbstractVector{<:AbstractFloat},
     #                          stop=sample_rate/2.0f0,
     #                          length=Float32(n_stft_bins))
     mel_samples = transpose(melscale_filterbanks(n_freqs = n_stft_bins,
-                                                 n_mels = n_frequency_buckets,
+                                                 n_mels = settings.n_output_frequency_buckets,
                                                  sample_rate = Int(sample_rate),
                                                  fmin=0.0f0,
                                                  fmax=sample_rate/2)
                            ) * stft_samples_mag
     mel_samples .= log.(mel_samples .+ @f32(1e-6))
+
+    return mel_samples
 end
 
-export nn_get_input_spectrogram
+export NN_InputSettings, nn_input_size, nn_get_input_spectrogram
 
+
+
+################################################################
+##   Splitting an audio file into multiple spectrogram batches
 
 "
-A lazy-iterator over the neural network inputs for small chunks of time (e.g. 1 second),
-   usually with overlap between the chunks.
+A lazy-iterator over the neural network inputs for a larger audio sample.
+The samples are split into 'chunks' with a certain duration and stride;
+   usually the stride is smaller than the duration so that the chunks overlap.
 
-All returned inputs are exactly the same size (`window_size_samples` x
-   `Int(sample_rate * chunk_size_seconds) ÷ window_sample_overlap`).
+All inputs will be a matrix of the size `nn_input_size(input_settings, chunk_size_samples)`.
 
 Iteration re-uses allocations internally, so you shouldn't hold onto data from one chunk
    while moving to the next!
+You can further eliminate heap allocations by providing `allocation_buffer`,
+   but then you shouldn't use this iterator more than once at a time.
 "
 @kwdef struct nn_chunked_audio{TSamples<:AbstractVector{<:AbstractFloat}, TWindow}
     samples::TSamples
     sample_rate::Float32
-    chunk_size_seconds::Float32
-    chunk_shift_seconds::Float32
 
-    # Inside each chunk the FFT is an STFT, a.k.a. a moving window of the chunk's samples.
-    window::TWindow = hanning
-    window_size_samples::Int = 1024
-    window_sample_overlap::Int = 512
-    n_frequency_buckets::Int = 64
+    chunk_size_samples::Int = 44100
+    chunk_shift_samples = chunk_size_samples ÷ 2
 
+    # Determines how to compute the sliding-window FFT within each chunk.
+    input_settings::NN_InputSettings{TWindow} = NN_InputSettings()
+
+    # If provided, prevents more heap allocations but also prevents
+    #    using the same iterator more than once at a time.
+    allocation_buffer::Optional{Vector{Float32}} = nothing
 end
-nn_chunked_audio(samples, sample_rate, chunk_size_seconds, chunk_shift_seconds; kw...) =
+nn_chunked_audio(samples, sample_rate, chunk_size_samples, chunk_shift_samples; kw...) =
     nn_chunked_audio(; samples=samples, sample_rate=sample_rate,
-                       chunk_size_seconds=chunk_size_seconds,
-                       chunk_shift_seconds=chunk_shift_seconds)
+                       chunk_size_samples=chunk_size_samples,
+                       chunk_shift_samples=chunk_shift_samples,
+                       kw...)
 
-Base.IteratorSize(::Type{<:nn_chunked_audio}) = Base.SizeUnknown()
+Base.length(chunker::nn_chunked_audio) = (length(chunker.samples) + chunker.chunk_shift_samples - 1) ÷ chunker.chunk_shift_samples
+
+"
+Gets the size of the 3D array containing all neural network inputs from the given chunked audio.
+In keeping with Flux.jl's standard, the last axis is batch index
+   (i.e. each XY slice is a single chunk's spectrogram).
+"
+nn_chunked_input_size(chunker::nn_chunked_audio)::NTuple{3, Int} = (
+    nn_input_size(chunker.input_settings, chunker.chunk_size_samples)...,
+    length(chunker)
+)
+
+Base.IteratorSize(::Type{<:nn_chunked_audio}) = Base.HasLength()
 Base.eltype(::Type{<:nn_chunked_audio}) = Matrix{Float32}
 
 function Base.iterate(chunker::nn_chunked_audio)
@@ -87,41 +139,133 @@ function Base.iterate(chunker::nn_chunked_audio)
 
     return impl_chunked_audio(
         chunker,
-        sample_range(chunker.sample_rate, 0.0f0, chunker.chunk_size_seconds),
-        0.0f0,
-        Float32[ ]
+        1:chunker.chunk_size_samples,
+        exists(chunker.allocation_buffer) ? chunker.allocation_buffer : Float32[ ]
     )
 end
-function Base.iterate(chunker::nn_chunked_audio, (prev_t, buffers...))
-    next_t = prev_t + chunker.chunk_shift_seconds
-    next_sample_idcs = sample_range(
-        chunker.sample_rate,
-        next_t,
-        chunker.chunk_size_seconds
-    )
+function Base.iterate(chunker::nn_chunked_audio, (sample_start, buffers...))
+    sample_idcs = sample_start:(sample_start + chunker.chunk_size_samples)
+    next_sample_start = sample_start + chunk.chunk_shift_samples
+    next_sample_idcs = range(start=next_sample_start,
+                             length=length(sample_idcs))
 
     if first(next_sample_idcs) > length(chunker.samples)
         return nothing
     else
-        return impl_chunked_audio(chunker, next_sample_idcs, next_t, buffers...)
+        return impl_chunked_audio(chunker, next_sample_idcs, buffers...)
     end
 end
 
 function impl_chunked_audio(chunker::nn_chunked_audio,
-                            sample_range::UnitRange{<:Integer}, sample_start_t::Float32,
+                            sample_range::UnitRange{<:Integer},
                             buffer1::Vector{Float32})
     pseudo_spectrogram = nn_get_input_spectrogram(
         samples_with_padding(chunker.samples, sample_range),
         chunker.sample_rate,
-        chunker.window,
-
-        window_size_samples=chunker.window_size_samples,
-        window_sample_overlap=chunker.window_sample_overlap,
-        n_frequency_buckets=chunker.n_frequency_buckets,
-
+        chunker.input_settings,
         buffer = buffer1
     )
-    return (pseudo_spectrogram, (sample_start_t, buffer1))
+    return (pseudo_spectrogram, (first(sample_range), buffer1))
 end
 
-export nn_chunked_audio
+
+function test_chunked_audio(chunker::nn_chunked_audio,
+                            make_plots::Bool = true,
+                            plots_use_full_spectrograrm::Bool = false)
+    estimated_progress_weight = 1 / length(chunker)
+    for (i, spectrogram::Matrix{Float32}) in enumerate(chunker)
+        if make_plots
+            (data, label) = if plots_use_full_spectrograrm
+                (spectrogram, "spectrogram $i")
+            else
+                (spectrogram[:, size(spectrogram, 2)÷2],
+                 "periodogram $i")
+            end
+            plot(data, label=label)
+        end
+        println("Progress: ", Int(round(100 * min(1.0, i * estimated_progress_weight))), "%")
+    end
+end
+
+export nn_chunked_audio, test_chunked_audio
+
+
+
+###################################################
+##   Network definition
+
+@kwdef struct NN_Settings{TWindow}
+    input_settings::NN_InputSettings{TWindow} = NN_InputSettings()
+    # The number of output nodes that will drive the visualizer.
+    # Note that in training, this is actually the middle layer --
+    #    the first half of the network computes these nodes,
+    #    and the second half tries to reconstruct the input from them.
+    n_outputs::Int = 8
+
+    # The music will be broken up into chunks of a given size,
+    #    usually with overlap between each chunk (by making 'shift' less than 'size').
+    chunk_size_samples::Int = 44100
+    chunk_shift_samples = chunk_size_samples ÷ 2
+
+    #TODO: Meaningful high-level parameters for convolutional layers
+end
+
+
+"The number of different convolution kernels in the final convolution layer"
+const NN_CONVOLUTION_OUT_N_CHANNELS = 64
+
+"Shorthand for the shape of the neural network data after the first convolutional layers"
+nn_chain_shape_after_convolution(settings::NN_Settings)::NTuple{3, Int} = (
+    (nn_input_size(settings.input_settings, settings.chunk_size_samples) .÷ Ref(4))...,
+    NN_CONVOLUTION_OUT_N_CHANNELS
+)
+
+
+"""
+Defines the first half of the neural net,
+   which compresses the input mel-spectrogram into a small number of visualizable outputs.
+
+To train this half without labeled data you also need a 'decoder' afterwards
+   which unpacks the outputs into a reconstruction of the input.
+"""
+nn_chain_encoder(settings::NN_Settings) = Chain(
+    # Convolutional layer with 32 different 3x3 kernels,
+    #    offsetting each kernel application by 2 pixels to halve the output resolution vs input.
+    Conv((3, 3), 1 => 32, relu;
+         stride=2, pad=1),
+    # Convolutional layer with 64 different 3x3 kernels,
+    #    offsetting each kernel applicationo by 2 pixels to halve the output resolution again.
+    Conv((3, 3), 32 => 64, relu;
+         stride=2, pad=1),
+
+    # Flatten the convolutional features into a 1D array (plus batch axis), for traditional NN layers:
+    x -> reshape(x, :, size(x, 4)),
+
+    # Add a traditional DNN layer.
+    Dense(prod(nn_chain_shape_after_convolution(settings)) => 128, relu),
+
+    # Add the output layer.
+    Dense(128 => settings.n_outputs)
+)
+
+"""
+Defines the second half of the neural net,
+   which decompresses the visualizer output into the input (a mel-spectrogram).
+
+This half is needed to train the first half without labeled data.
+"""
+nn_chain_decoder(settings::NN_Settings) = Chain(
+    # Invert the layers from the encoder.
+    Dense(settings.n_outputs => 128, relu),
+    Dense(128 => prod(nn_chain_shape_after_convolution(settings)), relu),
+    x -> let shape3D = nn_chain_shape_after_convolution(settings)
+           reshape(x, (shape3D..., size(x, 2)))
+    end,
+    ConvTranspose((3, 3), 64 => 32, relu;
+                  stride=2, pad=1),
+    ConvTranspose((3, 3), 32 => 1;
+                  stride=2, pad=1)
+)
+
+
+export NN_Settings, nn_chain_encoder, nn_chain_decoder

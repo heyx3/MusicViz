@@ -18,9 +18,12 @@ function samples_with_padding(all_samples::AbstractVector, samples_range::UnitRa
     front_padding = -min(first(samples_range), 0)
     back_padding = max(0, last(samples_range) + front_padding - length(all_samples))
 
-    return PaddedView(0.0f0, all_samples,
-                      (length(all_samples) + front_padding + back_padding, ),
-                      (1 + front_padding, ))
+    padded_samples = PaddedView(
+        0.0f0, all_samples,
+        (length(all_samples) + front_padding + back_padding, ),
+        (1 + front_padding, )
+    )
+    return @view padded_samples[(first(samples_range) + front_padding) : (last(samples_range) + front_padding)]
 end
 
 
