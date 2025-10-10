@@ -55,7 +55,7 @@ function nn_get_input_spectrogram(samples::AbstractVector{<:AbstractFloat},
     μ = mean(samples)
     σ = std(samples)
     resize!(buffer, length(samples))
-    buffer .= (samples .- μ) ./ (σ + @f32(1e-6))
+    buffer .= samples #((samples .- μ) ./ max(σ, @f32(1e-3))) .+ μ
 
     # Take a continuous sliding-window FFT of the samples.
     stft_samples_full = DSP.stft(buffer, settings.window_size_samples, settings.window_overlap_samples,
@@ -100,6 +100,7 @@ You can further eliminate heap allocations by providing `allocation_buffer`,
 @kwdef struct nn_chunked_audio{TSamples<:AbstractVector{<:AbstractFloat}, TWindow}
     samples::TSamples
     sample_rate::Float32
+    pad_samples::Bool = false # Enabling can introduce large errors in training/verification
 
     chunk_size_samples::Int = 44100
     chunk_shift_samples = chunk_size_samples ÷ 2
@@ -117,7 +118,9 @@ nn_chunked_audio(samples, sample_rate, chunk_size_samples, chunk_shift_samples; 
                        chunk_shift_samples=chunk_shift_samples,
                        kw...)
 
-Base.length(chunker::nn_chunked_audio) = (length(chunker.samples) + chunker.chunk_shift_samples - 1) ÷ chunker.chunk_shift_samples
+Base.length(chunker::nn_chunked_audio) = (length(chunker.samples) +
+                                            (chunker.pad_samples ? (chunker.chunk_shift_samples - 1) : 0)
+                                         ) ÷ chunker.chunk_shift_samples
 
 "
 Gets the size of the 3D array containing all neural network inputs from the given chunked audio.
@@ -133,7 +136,9 @@ Base.IteratorSize(::Type{<:nn_chunked_audio}) = Base.HasLength()
 Base.eltype(::Type{<:nn_chunked_audio}) = Matrix{Float32}
 
 function Base.iterate(chunker::nn_chunked_audio)
-    if isempty(chunker.samples)
+    if (chunker.pad_samples && isempty(chunker.samples)) ||
+       (!chunker.pad_samples && length(chunker.samples) < chunker.chunk_size_samples)
+    #begin
         return nothing
     end
 
@@ -145,11 +150,11 @@ function Base.iterate(chunker::nn_chunked_audio)
 end
 function Base.iterate(chunker::nn_chunked_audio, (sample_start, buffers...))
     sample_idcs = sample_start:(sample_start + chunker.chunk_size_samples)
-    next_sample_start = sample_start + chunk.chunk_shift_samples
+    next_sample_start = sample_start + chunker.chunk_shift_samples
     next_sample_idcs = range(start=next_sample_start,
                              length=length(sample_idcs))
 
-    if first(next_sample_idcs) > length(chunker.samples)
+    if (chunker.pad_samples ? first(next_sample_idcs) : last(next_sample_idcs)) > length(chunker.samples)
         return nothing
     else
         return impl_chunked_audio(chunker, next_sample_idcs, buffers...)
@@ -160,7 +165,9 @@ function impl_chunked_audio(chunker::nn_chunked_audio,
                             sample_range::UnitRange{<:Integer},
                             buffer1::Vector{Float32})
     pseudo_spectrogram = nn_get_input_spectrogram(
-        samples_with_padding(chunker.samples, sample_range),
+        chunker.pad_samples ?
+            samples_with_padding(chunker.samples, sample_range) :
+            @view(chunker.samples[sample_range]),
         chunker.sample_rate,
         chunker.input_settings,
         buffer = buffer1
@@ -315,3 +322,29 @@ nn_chain_full(settings::NN_Settings) = Chain(nn_chain_encoder(settings), nn_chai
 
 
 export NN_Settings, nn_chain_encoder, nn_chain_decoder, nn_chain_full
+
+
+#####################
+##    Training
+
+"""
+Trains and returns an autoencoder model (as separate encoder and decoder)
+  using the given audio files.
+Each file is expected to be an `AbstractVector{<:Real}`.
+"""
+function nn_train_new(iter_wav_channels, settings::NN_Settings)::Tuple{Chain, Chain}
+    # Initialize the models.
+    #TODO: Should they have random initial parameters? DO they already?
+    encoder = nn_chain_encoder(settings)
+    decoder = nn_chain_decoder(settings)
+    full_network = Chain(encoder, decoder)
+
+    # Set up the input data.
+    # in_data = Flux.DataLoader()
+
+    # optimizer = Flux.setup(Adam(), full_network)
+    # for epoch in 1:100
+    #     Flux.train!(full_network, iter_wav_channels)
+end
+
+export nn_train_new
